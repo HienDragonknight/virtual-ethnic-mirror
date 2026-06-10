@@ -110,6 +110,7 @@ function drawAffineTriangle(
  * @param canvasWidth - Canvas width in pixels
  * @param canvasHeight - Canvas height in pixels
  * @param scaleMultiplier - Width scale (default 2.2 = outfit is 2.2× shoulder width)
+ * @param _scaleMultiplier - Width scale (default 2.2 = outfit is 2.2× shoulder width)
  */
 export function drawSkeletonDrivenOutfit(
   ctx: CanvasRenderingContext2D,
@@ -117,7 +118,6 @@ export function drawSkeletonDrivenOutfit(
   landmarks: LandmarkPoint[],
   canvasWidth: number,
   canvasHeight: number,
-  scaleMultiplier: number = 2.2,
 ): void {
   if (landmarks.length < 29) return;
 
@@ -162,7 +162,6 @@ export function drawSkeletonDrivenOutfit(
 
   // ── Derived geometry ──
   const shoulderWidth = Math.abs(RS.x - LS.x);
-  const halfScale     = (shoulderWidth * scaleMultiplier) / 2;
   const shoulderMidX  = (LS.x + RS.x) / 2;
   const shoulderMidY  = (LS.y + RS.y) / 2;
 

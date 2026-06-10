@@ -41,11 +41,6 @@ import MirrorFrame from './MirrorFrame';
 import OutfitSelector from './OutfitSelector';
 import ControlPanel from './ControlPanel';
 
-// ─── Auto-fit parameters ─────────────────────────────────────────────────────
-// How many shoulder-widths the outfit should span (includes sleeves)
-const AUTO_FIT_SCALE = 2.2;
-// How far above shoulder midpoint the collar should sit (as fraction of torso height)
-const AUTO_FIT_COLLAR_LIFT = 0.08;
 
 export default function SmartMirror() {
   // === Refs ===
@@ -228,8 +223,7 @@ export default function SmartMirror() {
               litOutfit,
               latestLandmarksRef.current,
               width,
-              height,
-              selectedOutfit?.scaleMultiplier ?? 2.2,
+              height
             );
           } else {
             // Auto-fit collar position using nose landmark
