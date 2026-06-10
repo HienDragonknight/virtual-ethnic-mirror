@@ -12,10 +12,12 @@ interface ControlPanelProps {
   showSkeleton: boolean;
   enableOcclusion: boolean;
   enableWarping: boolean;
+  enableSkeletonDriven: boolean;
   fps: number;
   onToggleSkeleton: () => void;
   onToggleOcclusion: () => void;
   onToggleWarping: () => void;
+  onToggleSkeletonDriven: () => void;
   canvasRef: React.RefObject<HTMLCanvasElement>;
 }
 
@@ -26,10 +28,12 @@ export default function ControlPanel({
   showSkeleton,
   enableOcclusion,
   enableWarping,
+  enableSkeletonDriven,
   fps,
   onToggleSkeleton,
   onToggleOcclusion,
   onToggleWarping,
+  onToggleSkeletonDriven,
   canvasRef,
 }: ControlPanelProps) {
   /**
@@ -100,10 +104,17 @@ export default function ControlPanel({
           className={`toggle-button ${enableOcclusion ? 'toggle-active' : ''}`}
           onClick={onToggleOcclusion}
         >
-          <span className="toggle-track">
-            <span className="toggle-thumb" />
-          </span>
+          <span className="toggle-track"><span className="toggle-thumb" /></span>
           <span className="toggle-label">Arm Occlusion</span>
+        </button>
+
+        <button
+          id="skeleton-driven-toggle"
+          className={`toggle-button ${enableSkeletonDriven ? 'toggle-active' : ''}`}
+          onClick={onToggleSkeletonDriven}
+        >
+          <span className="toggle-track"><span className="toggle-thumb" /></span>
+          <span className="toggle-label">Full Body Fit</span>
         </button>
 
         <button
@@ -111,10 +122,8 @@ export default function ControlPanel({
           className={`toggle-button ${enableWarping ? 'toggle-active' : ''}`}
           onClick={onToggleWarping}
         >
-          <span className="toggle-track">
-            <span className="toggle-thumb" />
-          </span>
-          <span className="toggle-label">Mesh Warping</span>
+          <span className="toggle-track"><span className="toggle-thumb" /></span>
+          <span className="toggle-label">Mesh Warp (fallback)</span>
         </button>
       </div>
 

@@ -1,16 +1,13 @@
 'use client';
 // ============================================================================
-// SmartMirror — Main orchestrator component
+// SmartMirror — Production render pipeline (optimized)
 //
-// Production-grade render pipeline:
-//   1. Draw mirrored webcam video
-//   2. Run MediaPipe Pose detection → landmarks
-//   3. Run MediaPipe Body Segmentation → category mask
-//   4. Smooth body alignment (adaptive LERP)
-//   5. Analyze torso lighting for color grading
-//   6. Draw outfit overlay (mesh warped or rectangular fallback)
-//   7. Composite foreground occlusion (arms/head on top of outfit)
-//   8. Draw debug skeleton + FPS counter
+// Key optimizations vs previous version:
+//   ① Lighting-adjusted outfit canvas is CACHED in a ref — not recreated every frame
+//   ② Lighting only invalidates cache when luminance shifts > 8 units
+//   ③ Occlusion mask is throttled to every 3rd frame (imperceptible at 30fps)
+//   ④ Auto-fit computes outfit scale/position from REAL body measurements each frame
+//   ⑤ Nose landmark used to anchor collar accurately to neck area
 // ============================================================================
 
 import React, { useRef, useState, useCallback, useEffect } from 'react';
@@ -27,9 +24,10 @@ import {
   drawFpsCounter,
   removeWhiteBackground,
 } from '@/lib/canvasRenderer';
+import { drawSkeletonDrivenOutfit } from '@/lib/skeletonOutfit';
 import {
-  createForegroundMask,
-  compositeForground,
+  updateForegroundMask,
+  compositeForeground,
 } from '@/lib/occlusionCompositor';
 import {
   analyzeTorsoLuminance,
@@ -37,28 +35,49 @@ import {
   smoothLighting,
 } from '@/lib/lightingMatcher';
 import { OUTFITS } from '@/lib/outfits';
-import { OutfitItem, BodyAlignment, LightingInfo } from '@/types';
+import { OutfitItem, BodyAlignment, LightingInfo, LandmarkPoint } from '@/types';
 import LoadingScreen from './LoadingScreen';
 import MirrorFrame from './MirrorFrame';
 import OutfitSelector from './OutfitSelector';
 import ControlPanel from './ControlPanel';
 
+// ─── Auto-fit parameters ─────────────────────────────────────────────────────
+// How many shoulder-widths the outfit should span (includes sleeves)
+const AUTO_FIT_SCALE = 2.2;
+// How far above shoulder midpoint the collar should sit (as fraction of torso height)
+const AUTO_FIT_COLLAR_LIFT = 0.08;
+
 export default function SmartMirror() {
   // === Refs ===
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const outfitImageRef = useRef<HTMLImageElement | HTMLCanvasElement | null>(null);
+
+  // Raw outfit (after bg removal) — loaded once per selection
+  const outfitSourceRef = useRef<HTMLCanvasElement | null>(null);
+  // Lighting-adjusted outfit — cached, only rebuilt when lighting shifts significantly
+  const litOutfitCacheRef = useRef<HTMLCanvasElement | null>(null);
+  const lastLitLuminanceRef = useRef<number>(-999);
+
   const smoothedAlignmentRef = useRef<BodyAlignment | null>(null);
   const fpsRef = useRef<number>(0);
   const lightingRef = useRef<LightingInfo>({ avgLuminance: 128, avgR: 128, avgG: 128, avgB: 128 });
+
+  // Throttle refs
   const lightingFrameCounter = useRef<number>(0);
+  const occlusionFrameCounter = useRef<number>(0);
+  // Flag indicating if a foreground mask is loaded and available
+  const hasForegroundMaskRef = useRef<boolean>(false);
 
   // === State ===
   const [selectedOutfit, setSelectedOutfit] = useState<OutfitItem | null>(null);
   const [showSkeleton, setShowSkeleton] = useState(false);
   const [enableOcclusion, setEnableOcclusion] = useState(true);
-  const [enableWarping, setEnableWarping] = useState(true);
+  const [enableWarping, setEnableWarping] = useState(false);
+  const [enableSkeletonDriven, setEnableSkeletonDriven] = useState(true);
   const [outfitLoaded, setOutfitLoaded] = useState(false);
   const [displayFps, setDisplayFps] = useState(0);
+
+  // Keep latest landmarks accessible inside the frame callback without stale closure
+  const latestLandmarksRef = useRef<LandmarkPoint[] | null>(null);
 
   // === Hooks ===
   const { videoRef, isReady: isWebcamReady, error: webcamError, startWebcam } = useWebcam();
@@ -73,7 +92,9 @@ export default function SmartMirror() {
   // === Load outfit image when selection changes ===
   useEffect(() => {
     if (!selectedOutfit) {
-      outfitImageRef.current = null;
+      outfitSourceRef.current = null;
+      litOutfitCacheRef.current = null;
+      lastLitLuminanceRef.current = -999;
       setOutfitLoaded(false);
       return;
     }
@@ -82,14 +103,18 @@ export default function SmartMirror() {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
-      // Process the image on-the-fly to remove white background if present
+      // Process once: remove white background, store as source canvas
       const processed = removeWhiteBackground(img);
-      outfitImageRef.current = processed;
+      outfitSourceRef.current = processed;
+      // Invalidate lighting cache
+      litOutfitCacheRef.current = null;
+      lastLitLuminanceRef.current = -999;
       setOutfitLoaded(true);
     };
     img.onerror = () => {
       console.warn(`Failed to load outfit: ${selectedOutfit.src}`);
-      outfitImageRef.current = null;
+      outfitSourceRef.current = null;
+      litOutfitCacheRef.current = null;
       setOutfitLoaded(false);
     };
     img.src = selectedOutfit.src;
@@ -105,7 +130,7 @@ export default function SmartMirror() {
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
 
-      // Adaptive canvas scaling: Cap width to 960px for FPS stability
+      // ── Adaptive canvas scaling ──
       const maxWidthCap = 960;
       let targetWidth = video.videoWidth || 1280;
       let targetHeight = video.videoHeight || 720;
@@ -126,82 +151,125 @@ export default function SmartMirror() {
       // ── Step 1: Draw mirrored video frame ──
       drawMirroredVideo(ctx, video, width, height);
 
-      // ── Step 2: Run pose detection ──
-      if (isPoseReady && video.readyState >= 2) {
-        const landmarks = detect(video, timestamp);
+      if (!isPoseReady || video.readyState < 2) {
+        drawFpsCounter(ctx, fpsRef.current, width);
+        return;
+      }
 
-        // ── Step 3: Run body segmentation (parallel with pose processing) ──
-        let segMask: Uint8Array | null = null;
-        if (isSegmenterReady && enableOcclusion) {
-          segMask = segment(video, timestamp);
-        }
+      // ── Step 2: Pose detection ──
+      const landmarks = detect(video, timestamp);
 
-        if (landmarks && landmarks.length >= 25) {
-          const leftShoulder = landmarks[11];
-          const rightShoulder = landmarks[12];
-          
-          const isShoulderVisible = leftShoulder && rightShoulder && 
-                                    leftShoulder.visibility > 0.5 && 
-                                    rightShoulder.visibility > 0.5;
-
-          if (isShoulderVisible) {
-            // ── Step 4: Compute and smooth body alignment ──
-            const rawAlignment = computeBodyAlignment(landmarks, width, height);
-
-            if (smoothedAlignmentRef.current) {
-              smoothedAlignmentRef.current = smoothBodyAlignment(
-                smoothedAlignmentRef.current,
-                rawAlignment
-              );
-            } else {
-              smoothedAlignmentRef.current = rawAlignment;
-            }
-
-            // ── Step 5: Analyze torso lighting (every 10 frames for performance) ──
-            lightingFrameCounter.current++;
-            if (lightingFrameCounter.current % 10 === 0) {
-              const rawLighting = analyzeTorsoLuminance(ctx, smoothedAlignmentRef.current, width, height);
-              lightingRef.current = smoothLighting(lightingRef.current, rawLighting, 0.15);
-            }
-          }
-
-          // ── Step 6: Draw outfit overlay ──
-          if (
-            selectedOutfit &&
-            outfitImageRef.current &&
-            outfitLoaded &&
-            smoothedAlignmentRef.current
-          ) {
-            // Apply lighting adjustment to the outfit
-            const litOutfit = applyLightingToOutfit(outfitImageRef.current, lightingRef.current);
-
-            drawOutfitOverlay(
-              ctx,
-              litOutfit,
-              smoothedAlignmentRef.current,
-              selectedOutfit,
-              width,
-              height,
-              enableWarping
-            );
-          }
-
-          // ── Step 7: Composite foreground occlusion (arms/head on top) ──
-          if (segMask && enableOcclusion && selectedOutfit && outfitLoaded) {
-            const maskW = video.videoWidth;
-            const maskH = video.videoHeight;
-            const foregroundMask = createForegroundMask(segMask, maskW, maskH);
-            compositeForground(ctx, video, foregroundMask, maskW, maskH, width, height);
-          }
-
-          // ── Step 8: Draw skeleton debug ──
-          if (showSkeleton) {
-            drawSkeleton(ctx, landmarks, width, height);
-          }
+      // ── Step 3: Body segmentation (throttled to every 3rd frame) ──
+      occlusionFrameCounter.current++;
+      const doSegmentation = isSegmenterReady && enableOcclusion && (occlusionFrameCounter.current % 3 === 0);
+      if (doSegmentation) {
+        const segMask = segment(video, timestamp);
+        if (segMask) {
+          const maskW = video.videoWidth;
+          const maskH = video.videoHeight;
+          updateForegroundMask(segMask, maskW, maskH);
+          hasForegroundMaskRef.current = true;
         }
       }
 
-      // ── Step 9: Draw FPS counter ──
+      if (landmarks && landmarks.length >= 25) {
+        const leftShoulder  = landmarks[11];
+        const rightShoulder = landmarks[12];
+        const nose          = landmarks[0];
+
+        const isShoulderVisible =
+          leftShoulder && rightShoulder &&
+          leftShoulder.visibility > 0.4 &&
+          rightShoulder.visibility > 0.4;
+
+        if (isShoulderVisible) {
+          // ── Step 4: Compute and smooth body alignment ──
+          const rawAlignment = computeBodyAlignment(landmarks, width, height);
+
+          if (smoothedAlignmentRef.current) {
+            smoothedAlignmentRef.current = smoothBodyAlignment(
+              smoothedAlignmentRef.current,
+              rawAlignment
+            );
+          } else {
+            smoothedAlignmentRef.current = rawAlignment;
+          }
+
+          // ── Step 5: Lighting analysis (every 15 frames) ──
+          lightingFrameCounter.current++;
+          if (lightingFrameCounter.current % 15 === 0) {
+            const rawLighting = analyzeTorsoLuminance(ctx, smoothedAlignmentRef.current, width, height);
+            lightingRef.current = smoothLighting(lightingRef.current, rawLighting, 0.12);
+          }
+        }
+
+        // ── Step 6: Draw outfit ──
+        if (outfitSourceRef.current && outfitLoaded && smoothedAlignmentRef.current) {
+          const alignment = smoothedAlignmentRef.current;
+
+          // Rebuild lighting cache only when luminance shifts > 8 units
+          const currentLum = lightingRef.current.avgLuminance;
+          if (!litOutfitCacheRef.current || Math.abs(currentLum - lastLitLuminanceRef.current) > 8) {
+            litOutfitCacheRef.current = applyLightingToOutfit(outfitSourceRef.current, lightingRef.current);
+            lastLitLuminanceRef.current = currentLum;
+          }
+
+          const litOutfit = litOutfitCacheRef.current;
+
+          // Store latest valid landmarks for skeleton rendering
+          if (landmarks.length >= 29) {
+            latestLandmarksRef.current = landmarks;
+          }
+
+          // Render mode: Skeleton-driven (full body) > Mesh warp > Rectangular
+          if (enableSkeletonDriven && latestLandmarksRef.current) {
+            drawSkeletonDrivenOutfit(
+              ctx,
+              litOutfit,
+              latestLandmarksRef.current,
+              width,
+              height,
+              selectedOutfit?.scaleMultiplier ?? 2.2,
+            );
+          } else {
+            // Auto-fit collar position using nose landmark
+            let collarOffsetY = -0.08;
+            if (nose && nose.visibility > 0.4) {
+              const neckGap = alignment.shoulderMidpoint.y - nose.y;
+              collarOffsetY = -(neckGap * 0.65);
+            }
+            const autoFitConfig: OutfitItem = {
+              ...(selectedOutfit!),
+              scaleMultiplier: 2.2,
+              offsetY: collarOffsetY,
+            };
+            drawOutfitOverlay(ctx, litOutfit, alignment, autoFitConfig, width, height, enableWarping);
+          }
+        }
+
+
+        // ── Step 7: Composite foreground occlusion ──
+        if (
+          hasForegroundMaskRef.current &&
+          enableOcclusion &&
+          selectedOutfit &&
+          outfitLoaded
+        ) {
+          compositeForeground(
+            ctx,
+            video,
+            width,
+            height
+          );
+        }
+
+        // ── Step 8: Skeleton debug ──
+        if (showSkeleton) {
+          drawSkeleton(ctx, landmarks, width, height);
+        }
+      }
+
+      // ── Step 9: FPS counter ──
       drawFpsCounter(ctx, fpsRef.current, width);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -212,7 +280,6 @@ export default function SmartMirror() {
   const bothReady = isWebcamReady && isPoseReady;
   const { fps: currentFps } = useAnimationLoop(onFrame, bothReady);
 
-  // Sync FPS to ref for canvas drawing and to state for UI display
   useEffect(() => {
     fpsRef.current = currentFps;
     setDisplayFps(currentFps);
@@ -228,12 +295,10 @@ export default function SmartMirror() {
     ? 'Preparing pose detection...'
     : '';
 
-  // === Error handling ===
   const error = webcamError || poseError;
 
   return (
     <div className="smart-mirror-container">
-      {/* Hidden video element — feeds the canvas */}
       <video
         ref={videoRef}
         autoPlay
@@ -242,16 +307,13 @@ export default function SmartMirror() {
         className="hidden-video"
       />
 
-      {/* Main canvas — fullscreen */}
       <canvas
         ref={canvasRef}
         className="mirror-canvas"
       />
 
-      {/* HUD frame overlay */}
       <MirrorFrame />
 
-      {/* Left panel — outfit selector + controls */}
       <div className="left-panel">
         <OutfitSelector
           outfits={OUTFITS}
@@ -266,18 +328,18 @@ export default function SmartMirror() {
           showSkeleton={showSkeleton}
           enableOcclusion={enableOcclusion}
           enableWarping={enableWarping}
+          enableSkeletonDriven={enableSkeletonDriven}
           fps={displayFps}
           onToggleSkeleton={() => setShowSkeleton((prev) => !prev)}
           onToggleOcclusion={() => setEnableOcclusion((prev) => !prev)}
           onToggleWarping={() => setEnableWarping((prev) => !prev)}
+          onToggleSkeletonDriven={() => setEnableSkeletonDriven((prev) => !prev)}
           canvasRef={canvasRef as React.RefObject<HTMLCanvasElement>}
         />
       </div>
 
-      {/* Loading screen overlay */}
       <LoadingScreen isVisible={isLoading} progress={loadingProgress} />
 
-      {/* Error overlay */}
       {error && (
         <div className="error-overlay">
           <div className="error-card">
